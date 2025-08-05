@@ -78,6 +78,7 @@ def save_path_as_csv(path, filename, resolution, origin, image_height):
 
 
 if __name__ == "__main__":
+    
     map_yaml_path = "example_map.yaml"
     downsample_factor = 8  # Ajusta este valor según lo que necesites
 
