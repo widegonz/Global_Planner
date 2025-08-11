@@ -10,5 +10,6 @@ mkdocstrings    # >=0.27.0
 mkdocstrings-python==1.12.2
 mkdocs-material # >=9.5.45
 mike
+typeguard
 opencv-python
 pyyaml
