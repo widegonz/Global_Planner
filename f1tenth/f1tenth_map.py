@@ -6,13 +6,18 @@ import numpy as np
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from python_motion_planning.utils import Grid, SearchFactory
+from pathlib import Path
 
 
 def load_map(yaml_path, downsample_factor=1):
-    with open(yaml_path, 'r') as f:
+    yaml_path = Path(yaml_path)  # asegurar Path
+    with yaml_path.open('r') as f:
         map_config = yaml.safe_load(f)
 
-    img_path = map_config['image']  # Usa directamente si ya lo has verificado
+
+    img_path = Path(map_config['image'])
+    if not img_path.is_absolute():
+        img_path = (yaml_path.parent / img_path).resolve()
     map_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     resolution = map_config['resolution']
     origin = map_config['origin']
@@ -78,14 +83,14 @@ def save_path_as_csv(path, filename, resolution, origin, image_height):
 
 
 if __name__ == "__main__":
-    
-    map_yaml_path = "example_map.yaml"
+    HERE = Path(__file__).resolve().parent
+    yaml_path = HERE.parent / "Mapas-F1Tenth" / "example_map.yaml"
     downsample_factor = 8  # Ajusta este valor según lo que necesites
 
     x_start, y_start = 0.0, 1.0
     x_goal, y_goal = 0.0, -1.5
 
-    map_bin, resolution, origin = load_map(map_yaml_path, downsample_factor)
+    map_bin, resolution, origin = load_map(yaml_path, downsample_factor)
     env = grid_from_map(map_bin)
 
     start = world_to_map(x_start, y_start, resolution, origin)

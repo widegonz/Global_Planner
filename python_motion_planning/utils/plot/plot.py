@@ -141,7 +141,7 @@ class Plot:
         plt.plot(self.start.x, self.start.y, marker="s", color="#ff0000")
         plt.plot(self.goal.x, self.goal.y, marker="s", color="#1155cc")
 
-    def plotAgent(self, pose: tuple, radius: float=1) -> None:
+    def plotAgent(self, pose: tuple, radius: float=0.1) -> None:
         '''
         Plot agent with specifical pose.
 

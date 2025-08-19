@@ -1,146 +1,228 @@
-"""
-@file: lqr.py
-@breif: Linear Quadratic Regulator(LQR) motion planning
-@author: Yang Haodong, Wu Maojia
-@update: 2024.6.25
-"""
+# lqr.py
 import numpy as np
-
 from .local_planner import LocalPlanner
 from python_motion_planning.utils import Env
+from python_motion_planning.utils import SearchFactory
 
 class LQR(LocalPlanner):
-    """
-    Class for Linear Quadratic Regulator(LQR) motion planning.
-
-    Parameters:
-        start (tuple): start point coordinate
-        goal (tuple): goal point coordinate
-        env (Env): environment
-        heuristic_type (str): heuristic function type
-        **params: other parameters can be found in the parent class LocalPlanner
-
-    Examples:
-        >>> from python_motion_planning.utils import Grid
-        >>> from python_motion_planning.local_planner import LQR
-        >>> start = (5, 5, 0)
-        >>> goal = (45, 25, 0)
-        >>> env = Grid(51, 31)
-        >>> planner = LQR(start, goal, env)
-        >>> planner.run()
-    """
     def __init__(self, start: tuple, goal: tuple, env: Env, heuristic_type: str = "euclidean", **params) -> None:
         super().__init__(start, goal, env, heuristic_type, **params)
-        # LQR parameters
-        self.Q = np.diag([1, 1, 1])
-        self.R = np.diag([1, 1])
-        self.lqr_iteration = 100
-        self.eps_iter = 1e-1
 
-        # global planner
-        g_start = (start[0], start[1])
-        g_goal  = (goal[0], goal[1])
-        self.g_planner = {"planner_name": "a_star", "start": g_start, "goal": g_goal, "env": env}
-        self.path = self.g_path[::-1]
+        # LQR params (ajústalos si quieres)
+        self.Q = params.get("Q", np.diag([1.0, 1.0, 1.0]))
+        self.R = params.get("R", np.diag([1.0, 1.0]))
+        self.lqr_iteration = params.get("lqr_iteration", 100)
+        self.eps_iter = params.get("eps_iter", 1e-1)
+
+        # ---- Ruta global ----
+        # Si el usuario ya pasó una ruta (lista de (ix,iy)), úsala.
+        # Si no, opcionalmente puedes computarla aquí (solo si tu framework lo soporta).
+        if "path" in params and params["path"]:
+            self.path = params["path"]   # se espera start->goal
 
     def __str__(self) -> str:
         return "Linear Quadratic Regulator (LQR)"
 
-    def plan(self):
-        """
-        LQR motion plan function.
-
-        Returns:
-            flag (bool): planning successful if true else failed
-            pose_list (list): history poses of robot
-        """
+    # def plan(self):
         dt = self.params["TIME_STEP"]
+
+        # tolerancias razonables (ajusta a tu grid)
+        GOAL_POS_TOL = self.params.get("GOAL_POS_TOL", 1.0)    # en celdas
+        GOAL_YAW_TOL = self.params.get("GOAL_YAW_TOL", np.deg2rad(10))
+
+        # velocidad mínima para “despegar” cuando ya apunto bien
+        V_FEED = self.params.get("V_FEED", 0.3)
+
+        # detector de atasco
+        stuck_window = 200          # pasos para evaluar
+        min_prog     = 0.2          # avance mínimo en celdas
+        last_check_p = np.array([self.robot.px, self.robot.py], dtype=float)
+        steps_since  = 0
+
         for _ in range(self.params["MAX_ITERATION"]):
-            # break until goal reached
-            if self.reachGoal(tuple(self.robot.state.squeeze(axis=1)[0:3]), self.goal):
+            # criterio de llegada más laxo
+            dx = self.robot.px - self.goal[0]
+            dy = self.robot.py - self.goal[1]
+            dpos = np.hypot(dx, dy)
+            if dpos < GOAL_POS_TOL and abs(self.regularizeAngle(self.robot.theta - self.goal[2])) < GOAL_YAW_TOL:
                 return True, self.robot.history_pose
 
-            # get the particular point on the path at the lookahead distance
-            lookahead_pt, theta_trj, kappa = self.getLookaheadPoint()
-
-            # calculate velocity command
-            e_theta = self.regularizeAngle(self.robot.theta - self.goal[2])
-            if not self.shouldMoveToGoal(self.robot.position, self.goal):
-                if not self.shouldRotateToPath(abs(e_theta)):
-                    u = np.array([[0], [0]])
-                else:
-                    u = np.array([[0], [self.angularRegularization(e_theta / dt)]])
+            # lookahead robusto
+            out = self.getLookaheadPoint()
+            if out is None:
+                # si tu getLookaheadPoint no puede, empuja hacia goal directo
+                lookahead_pt = (self.goal[0], self.goal[1])
+                theta_trj = self.angle(self.robot.position, lookahead_pt)
+                kappa = 0.0
             else:
-                e_theta = self.regularizeAngle(
-                    self.angle(self.robot.position, lookahead_pt) - self.robot.theta
-                )
-                if self.shouldRotateToPath(abs(e_theta)):
-                    u = np.array([[0], [self.angularRegularization(e_theta / dt)]])
-                else:
-                    s = (self.robot.px, self.robot.py, self.robot.theta) # current state
-                    s_d = (lookahead_pt[0], lookahead_pt[1], theta_trj)  # desired state
-                    u_r = (self.robot.v, self.robot.v * kappa)           # refered input
-                    u = self.lqrControl(s, s_d, u_r)
+                lookahead_pt, theta_trj, kappa = out
 
-            # feed into robotic kinematic
+            # control
+            e_theta_goal = self.regularizeAngle(self.robot.theta - self.goal[2])
+
+            # ¿me muevo hacia waypoint o roto?
+            # Regla simple: si el heading hacia el lookahead es razonable, avanza.
+            e_theta_path = self.regularizeAngle(self.angle(self.robot.position, lookahead_pt) - self.robot.theta)
+            heading_ok = abs(e_theta_path) < np.deg2rad(20)
+
+            if not heading_ok:
+                # rota en el sitio
+                u = np.array([[0.0], [self.angularRegularization(e_theta_path / dt)]])
+            else:
+                # LQR con feedforward; si v≈0, fuerza un V_FEED
+                v_ref = max(self.robot.v, V_FEED)
+                u_r = (v_ref, v_ref * kappa)
+
+                s   = (self.robot.px, self.robot.py, self.robot.theta)
+                s_d = (lookahead_pt[0], lookahead_pt[1], theta_trj)
+
+                # --- LQR robusto (pequeña reg. a S) ---
+                dt = self.params["TIME_STEP"]
+                A = np.identity(3)
+                A[0, 2] = -u_r[0] * np.sin(s_d[2]) * dt
+                A[1, 2] =  u_r[0] * np.cos(s_d[2]) * dt
+                B = np.zeros((3, 2))
+                B[0, 0] = np.cos(s_d[2]) * dt
+                B[1, 0] = np.sin(s_d[2]) * dt
+                B[2, 1] = dt
+
+                P = self.Q.copy()
+                for _it in range(self.lqr_iteration):
+                    BT_P = B.T @ P
+                    S = self.R + BT_P @ B
+                    # regularización (muy pequeña) para evitar singularidad
+                    S = S + 1e-9 * np.eye(S.shape[0])
+                    Ktmp = np.linalg.inv(S) @ (BT_P @ A)
+                    P_new = self.Q + A.T @ P @ A - A.T @ P @ B @ Ktmp
+                    if np.max(np.abs(P_new - P)) < self.eps_iter:
+                        P = P_new
+                        break
+                    P = P_new
+
+                S = self.R + B.T @ P @ B
+                S = S + 1e-9 * np.eye(S.shape[0])
+                K = np.linalg.inv(S) @ (B.T @ P @ A)
+
+                e = np.array([[s[0] - s_d[0]],
+                            [s[1] - s_d[1]],
+                            [self.regularizeAngle(s[2] - s_d[2])]])
+
+                u = np.array([[u_r[0]], [u_r[1]]]) - K @ e
+                u = np.array([
+                    [self.linearRegularization(float(u[0]))],
+                    [self.angularRegularization(float(u[1]))]
+                ])
+
+            # cinemática
             self.robot.kinematic(u, dt)
-        
+
+            # --- detector de atasco: si no avanzas, cambia estrategia ---
+            steps_since += 1
+            if steps_since >= stuck_window:
+                now_p = np.array([self.robot.px, self.robot.py], dtype=float)
+                if np.linalg.norm(now_p - last_check_p) < min_prog:
+                    # empujón: ignora LQR una vez y ve directo al lookahead con avance fijo
+                    e_theta_path = self.regularizeAngle(self.angle((self.robot.px, self.robot.py), lookahead_pt) - self.robot.theta)
+                    self.robot.kinematic(np.array([[V_FEED], [self.angularRegularization(e_theta_path / dt)]]), dt)
+                last_check_p = now_p
+                steps_since = 0
+
         return False, None
 
-    def run(self):
-        """
-        Running both plannig and animation.
-        """
-        _, history_pose = self.plan()
-        if not history_pose:
-            raise ValueError("Path not found and planning failed!")
+    def plan(self):
+        dt = self.params["TIME_STEP"]
+        POS_TOL  = self.params.get("GOAL_POS_TOL", 1.0)
+        YAW_TOL  = self.params.get("GOAL_YAW_TOL", np.deg2rad(12))
+        V_FEED   = self.params.get("V_FEED", 0.25)
 
+        for _ in range(self.params["MAX_ITERATION"]):
+            # goal check
+            dx, dy = self.robot.px - self.goal[0], self.robot.py - self.goal[1]
+            if np.hypot(dx, dy) < POS_TOL and abs(self.regularizeAngle(self.robot.theta - self.goal[2])) < YAW_TOL:
+                return True, self.robot.history_pose
+
+            out = self.getLookaheadPoint()
+            if out is None:
+                lookahead_pt = (self.goal[0], self.goal[1])
+                theta_trj, kappa = self.angle(self.robot.position, lookahead_pt), 0.0
+            else:
+                lookahead_pt, theta_trj, kappa = out
+
+            e_theta = self.regularizeAngle(self.angle(self.robot.position, lookahead_pt) - self.robot.theta)
+            if abs(e_theta) > np.deg2rad(20):
+                u = np.array([[0.0], [self.angularRegularization(e_theta / dt)]])
+            else:
+                v_ref = max(self.robot.v, V_FEED)
+                u_r   = (v_ref, v_ref * kappa)
+                s, s_d = (self.robot.px, self.robot.py, self.robot.theta), (lookahead_pt[0], lookahead_pt[1], theta_trj)
+
+                # LQR mínimo con regularización
+                A = np.eye(3); A[0,2] = -u_r[0]*np.sin(s_d[2])*dt; A[1,2] = u_r[0]*np.cos(s_d[2])*dt
+                B = np.zeros((3,2)); B[0,0] = np.cos(s_d[2])*dt; B[1,0] = np.sin(s_d[2])*dt; B[2,1] = dt
+                P = self.Q.copy()
+                for _it in range(self.lqr_iteration):
+                    BT_P = B.T @ P
+                    S = self.R + BT_P @ B + 1e-9*np.eye(2)
+                    Ktmp = np.linalg.inv(S) @ (BT_P @ A)
+                    P_new = self.Q + A.T @ P @ A - A.T @ P @ B @ Ktmp
+                    if np.max(np.abs(P_new - P)) < self.eps_iter: P = P_new; break
+                    P = P_new
+
+                S = self.R + B.T @ P @ B + 1e-9*np.eye(2)
+                K = np.linalg.inv(S) @ (B.T @ P @ A)
+                e = np.array([[s[0]-s_d[0]],[s[1]-s_d[1]],[self.regularizeAngle(s[2]-s_d[2])]])
+                u = np.array([[u_r[0]],[u_r[1]]]) - K @ e
+                u = np.array([[self.linearRegularization(float(u[0]))],
+                            [self.angularRegularization(float(u[1]))]])
+
+            self.robot.kinematic(u, dt)
+
+        return False, None
+
+
+    def run(self):
+        ok, history_pose = self.plan()
+        if not ok or not history_pose:
+            raise ValueError("Path not found and planning failed!")
         path = np.array(history_pose)[:, 0:2]
         cost = np.sum(np.sqrt(np.sum(np.diff(path, axis=0)**2, axis=1, keepdims=True)))
         self.plot.plotPath(self.path, path_color="r", path_style="--")
         self.plot.animation(path, str(self), cost, history_pose=history_pose)
 
     def lqrControl(self, s: tuple, s_d: tuple, u_r: tuple) -> np.ndarray:
-        """
-        Execute LQR control process.
-
-        Parameters:
-            s (tuple): current state
-            s_d (tuple): desired state
-            u_r (tuple): refered control
-
-        Returns:
-            u (np.ndarray): control vector
-        """
         dt = self.params["TIME_STEP"]
 
-        # state equation on error
+        # linealización en torno al estado deseado y u_r
         A = np.identity(3)
         A[0, 2] = -u_r[0] * np.sin(s_d[2]) * dt
-        A[1, 2] = u_r[0] * np.cos(s_d[2]) * dt
+        A[1, 2] =  u_r[0] * np.cos(s_d[2]) * dt
 
         B = np.zeros((3, 2))
         B[0, 0] = np.cos(s_d[2]) * dt
         B[1, 0] = np.sin(s_d[2]) * dt
         B[2, 1] = dt
 
-        # discrete iteration Ricatti equation
-        P, P_ = np.zeros((3, 3)), np.zeros((3, 3))
-        P = self.Q
-
-        # iteration
+        # Riccati discreto por iteración
+        P  = self.Q.copy()
         for _ in range(self.lqr_iteration):
-            P_ = self.Q + A.T @ P @ A - A.T @ P @ B @ np.linalg.inv(self.R + B.T @ P @ B) @ B.T @ P @ A
-            if np.max(P - P_) < self.eps_iter:
+            BT_P = B.T @ P
+            S = self.R + BT_P @ B
+            Ktmp = np.linalg.inv(S) @ (BT_P @ A)
+            P_new = self.Q + A.T @ P @ A - A.T @ P @ B @ Ktmp
+            if np.max(np.abs(P_new - P)) < self.eps_iter:
+                P = P_new
                 break
-            P = P_
+            P = P_new
 
-        # feedback
-        K = -np.linalg.inv(self.R + B.T @ P_ @ B) @ B.T @ P_ @ A
-        e = np.array([[s[0] - s_d[0]], [s[1] - s_d[1]], [self.regularizeAngle(s[2] - s_d[2])]])
-        u = np.array([[u_r[0]], [u_r[1]]]) + K @ e
+        # Ganancia y control
+        S = self.R + B.T @ P @ B
+        K = np.linalg.inv(S) @ (B.T @ P @ A)
+        e = np.array([[s[0] - s_d[0]],
+                      [s[1] - s_d[1]],
+                      [self.regularizeAngle(s[2] - s_d[2])]])
+        u = np.array([[u_r[0]], [u_r[1]]]) - K @ e
 
         return np.array([
-            [self.linearRegularization(float(u[0]))], 
+            [self.linearRegularization(float(u[0]))],
             [self.angularRegularization(float(u[1]))]
         ])

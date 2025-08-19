@@ -3,6 +3,7 @@ __pycache__/
 build/
 devel/
 docs/
+entorno/
 python_motion_planning.egg-info/
 # local env files
 .env.local

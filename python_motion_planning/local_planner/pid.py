@@ -6,6 +6,8 @@
 """
 import numpy as np
 import math
+import csv
+import os
 
 from .local_planner import LocalPlanner
 from python_motion_planning.utils import Env, MathHelper
@@ -31,23 +33,65 @@ class PID(LocalPlanner):
         >>> planner = PID(start, goal, env)
         >>> planner.run()
     """
+    # def __init__(self, start: tuple, goal: tuple, env: Env, heuristic_type: str = "euclidean",
+    #              k_v_p: float = 1.00, k_v_i: float = 0.10, k_v_d: float = 0.10,
+    #              k_w_p: float = 1.00, k_w_i: float = 0.10, k_w_d: float = 0.10,
+    #              k_theta: float = 0.75, **params) -> None:
+    #     super().__init__(start, goal, env, heuristic_type, MIN_LOOKAHEAD_DIST=0.75, **params)
+    #     # PID parameters
+    #     self.e_w, self.i_w = 0.0, 0.0
+    #     self.e_v, self.i_v = 0.0, 0.0
+    #     self.k_v_p, self.k_v_i, self.k_v_d = k_v_p, k_v_i, k_v_d
+    #     self.k_w_p, self.k_w_i, self.k_w_d = k_w_p, k_w_i, k_w_d
+    #     self.k_theta = k_theta
+
+    #     # global planner
+    #     g_start = (start[0], start[1])
+    #     g_goal  = (goal[0], goal[1])
+    #     self.g_planner = {"planner_name": "a_star", "start": g_start, "goal": g_goal, "env": env}
+    #     self.path = self.g_path[::-1]
+    
     def __init__(self, start: tuple, goal: tuple, env: Env, heuristic_type: str = "euclidean",
                  k_v_p: float = 1.00, k_v_i: float = 0.10, k_v_d: float = 0.10,
                  k_w_p: float = 1.00, k_w_i: float = 0.10, k_w_d: float = 0.10,
-                 k_theta: float = 0.75, **params) -> None:
-        super().__init__(start, goal, env, heuristic_type, MIN_LOOKAHEAD_DIST=0.75, **params)
-        # PID parameters
+                 k_theta: float = 0.75, path=None, min_lookahead_dist: float = 0.15, **params) -> None:
+        """
+        path: lista de (i, j) en GRID (start->goal). Si se pasa, se usa directamente.
+        min_lookahead_dist: distancia de seguimiento (en unidades del grid del planner).
+        """
+        super().__init__(start, goal, env, heuristic_type, MIN_LOOKAHEAD_DIST=min_lookahead_dist, **params)
+
+        # PID gains
         self.e_w, self.i_w = 0.0, 0.0
         self.e_v, self.i_v = 0.0, 0.0
         self.k_v_p, self.k_v_i, self.k_v_d = k_v_p, k_v_i, k_v_d
         self.k_w_p, self.k_w_i, self.k_w_d = k_w_p, k_w_i, k_w_d
         self.k_theta = k_theta
 
-        # global planner
-        g_start = (start[0], start[1])
-        g_goal  = (goal[0], goal[1])
-        self.g_planner = {"planner_name": "a_star", "start": g_start, "goal": g_goal, "env": env}
-        self.path = self.g_path[::-1]
+        self._t = 0.0 #NEW
+        # ...
+        log_file = params.get("LOG_FILE", "pid_cmd_log.csv")
+        self.log_path = os.path.abspath(log_file)
+        with open(self.log_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "time[s]", "v[m/s]", "w[rad/s]",
+                "wp_x", "wp_y", "theta_wp[rad]"
+                # opcional: "theta_trj[rad]", "theta_d[rad]"
+            ])
+
+        # --- resolución/origen para convertir grid->mundo ---
+        self.resolution = getattr(env, "resolution", params.get("resolution", None))
+        self.origin     = getattr(env, "origin",     params.get("origin", None))
+        if self.resolution is None or self.origin is None:
+            raise ValueError("PID necesita resolution y origin (del env o vía params).")
+
+        # Global path
+        if path is not None:
+            # usa el path proporcionado (grid coords, start->goal)
+            self.path = list(path)
+        else:
+            raise ValueError("PID: no se pudo obtener ruta global (A* vacío).")
 
     def __str__(self) -> str:
         return "PID Planner"
@@ -68,6 +112,11 @@ class PID(LocalPlanner):
             
             # find next tracking point
             lookahead_pt, theta_trj, _ = self.getLookaheadPoint()
+            # lookahead_pt son índices (i, j)
+            wp_x_map, wp_y_map = lookahead_pt[0], lookahead_pt[1]
+
+            # convierte a mundo
+            wp_x, wp_y = self._map_to_world(wp_x_map, wp_y_map)
 
             # desired angle
             theta_err = self.angle(self.robot.position, lookahead_pt)
@@ -92,6 +141,24 @@ class PID(LocalPlanner):
                 else:
                     v_d = self.dist(lookahead_pt, self.robot.position) / dt
                     u = np.array([[self.linearRegularization(v_d)], [self.angularRegularization(e_theta / dt)]])
+
+            # --- PRINT en tiempo real ---
+            v_k = float(u[0, 0])
+            w_k = float(u[1, 0])
+            # guarda en archivo
+            with open(self.log_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    f"{self._t:.2f}",
+                    f"{v_k:.2f}",
+                    f"{w_k:.2f}",
+                    f"{wp_x:.2f}",
+                    f"{wp_y:.2f}",
+                    f"{e_theta:.2f}",
+                    # opcional: f"{theta_trj_val:.2f}", f"{theta_d_val:.2f}"
+                ])
+            # -----------------------------
+            self._t += dt
 
             # feed into robotic kinematic
             self.robot.kinematic(u, dt)
@@ -156,3 +223,9 @@ class PID(LocalPlanner):
         w = MathHelper.clamp(w, self.params["MIN_W"], self.params["MAX_W"])
 
         return w
+    
+    def _map_to_world(self, x_map: float, y_map: float):
+        # y no se invierte aquí porque ya lo hiciste al construir env
+        x_w = x_map * self.resolution + self.origin[0]
+        y_w = y_map * self.resolution + self.origin[1]
+        return x_w, y_w
