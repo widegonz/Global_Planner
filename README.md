@@ -1,6 +1,6 @@
 # Planificador de Trayectorias A* para F1TENTH
 
-Este repositorio permite cargar mapas tipo `YAML + PNG`, realizar la binarización, aplicar reducción de resolución (*downsampling*), convertir a formato de cuadrícula, ejecutar el algoritmo de planificación A* y exportar el camino generado en un archivo `.csv`.
+Este repositorio permite cargar mapas tipo `YAML + PNG`, realizar la binarización, aplicar reducción de resolución (*downsampling*), convertir a formato de cuadrícula, ejecutar varios algoritmos de planificación y exportar el camino generado en un archivo `.csv`.
 
 ---
 
