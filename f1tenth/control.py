@@ -128,7 +128,8 @@ if __name__ == "__main__":
     # 5) correr animación
     pid.run()
 # if __name__ == "__main__":
-    yaml_path = "example_map.yaml"
+    HERE = Path(__file__).resolve().parent
+    yaml_path = HERE.parent / "Mapas-F1Tenth" / "example_map.yaml"
     factor = 8
 
     # 1) mapa -> grid
